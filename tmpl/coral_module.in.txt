@@ -1,0 +1,45 @@
+## %NAME% Coral Module Build
+##
+## This is a module project intended to be built as
+## part of a large superproject that supplies the
+## package definitions in a flat structure.
+##
+##
+cmake_minimum_required(VERSION 3.12)
+project(%NAME% VERSION 0.0.1)
+
+set(CMAKE_C_STANDARD 11)
+add_compile_options(-W -Wall -Wextra -Wpedantic)
+
+if (NOT DEFINED CORAL_PROJECT_NAME)
+  message(
+    FATAL_ERROR
+    "${PROJECT_NAME} is a Coral Module and must be built as part of a project."
+  )
+endif()
+
+## Find Package Dependencies:
+
+
+## Build Library: %NAME%
+set(SOURCES
+)
+
+add_library(%NAME% ${SOURCES})
+target_include_directories(%NAME% PUBLIC "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(%NAME% PRIVATE
+)
+
+
+## Build: sge_tests executable
+## SGE Unit Tests
+##
+file(GLOB_RECURSE TEST_SOURCES t/*.c .)
+add_executable(%NAME%_tests ${TEST_SOURCES})
+target_include_directories(%NAME%_tests PRIVATE src)
+target_link_libraries(%NAME%_tests PRIVATE
+  %NAME%
+  ctest)
+
+enable_testing()
+add_test(NAME %NAME%_tests COMMAND %NAME%_tests)

@@ -1,0 +1,30 @@
+cmake_minimum_required(VERSION 3.12)
+
+## %NAME% Coral Project File
+## This is the top-level CMake file. Its only purpose
+## is to define generic resources and declare modules
+## and entrypoints. Language options should be chosen
+## on a per module basis.
+project(%NAME% C)
+
+set(CORAL_PROJECT_NAME ${PROJECT_NAME})
+
+## CMake scripts and external modules:
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${PROJECT_SOURCE_DIR}/cmake")
+include(CTest)
+
+## Make documentation (across all modules):
+find_package(Doxygen)
+if(DOXYGEN_FOUND)
+  configure_file(${CMAKE_SOURCE_DIR}/Doxyfile.cmake.in ${CMAKE_BINARY_DIR}/Doxyfile @ONLY)
+  add_custom_target(doc
+    ${DOXYGEN_EXECUTABLE} ${CMAKE_BINARY_DIR}/Doxyfile
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Generating API documentation with Doxygen" VERBATIM
+  )
+endif(DOXYGEN_FOUND)
+
+
+## Library Modules:
+
+## Entrypoint Projects:

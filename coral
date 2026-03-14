@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+
+## coral - Structured Project Info for CMake
+##
+## coral is inspired by Polylith but intended to be a little more flexible
+## about architectural decisions. All that should be required is clean CMake
+## project structure and this script will build as much working knowledge as
+## it can to show libraries, module dependencies and module stats.
+##
+## This script is a work in progress and currently assumes projects are C
+## language when looking for .c and .h files for line counting.
+##
+## TODO: Add better module level line counting and differentiate files by target.
+## TODO: Respect exclude filter when counting lines of code.
+
+import os
+import re
+import argparse
+from os.path import dirname
+from operator import itemgetter
+from pathlib import Path
+from collections import defaultdict
+from termcolor import colored
+
+# Regex patterns
+FIND_PACKAGE_RE = re.compile(r'\bfind_package\s*\(\s*([^\s)]+)', re.IGNORECASE)
+ADD_LIBRARY_RE = re.compile(r'\badd_library\s*\(\s*([^\s)]+)', re.IGNORECASE)
+ADD_EXECUTABLE_RE = re.compile(r'\badd_executable\s*\(\s*([^\s)]+)', re.IGNORECASE)
+TARGET_LINK_LIBRARIES_RE = re.compile(r'\btarget_link_libraries\s*\(\s*([^\s)]+)\s+([^)]+)\)', re.IGNORECASE)
+ANSI_ESCAPE_RE = re.compile(r'\x1b\[.*?m')
+
+# Global config for color
+USE_COLOR = True
+INCLUDE_TESTS = False
+EXCLUDE = "!no_path_matches_by_default!"
+
+STANDARD_LIBRARIES = {
+    'c': 'C stdlib',        # Usually linked by default/implied.
+    'm': 'C math',
+    'rt': 'C realtime',
+    'pthread': 'C pthread',
+    'dl': 'C dynlink',
+    'util': 'C misc',
+    'nsl': 'C net srv',
+    'resolv': 'C resolv'
+}
+
+
+def friendly_lib_name(lib):
+    """
+    Transform library names to be more readable:
+     - Standard C libraries named per `STANDARD_LIBRARIES`
+     - CMake namespaced modules de-deduped, e.g. SDL3::SDL3 => SDL3
+     - CMake namespaced modules shortened, e.g. SDL3::Image => SDL3-Image
+    """
+    if lib in STANDARD_LIBRARIES:
+        return STANDARD_LIBRARIES[lib]
+
+    if '::' in lib:
+        group, lib = lib.split('::', 1)
+
+        if group == lib:
+            return lib
+        else:
+            return f'{group}-{lib}'
+    return lib
+
+
+def strip_ansi(text):
+    return ANSI_ESCAPE_RE.sub('', text)
+
+
+def color_module(name, kind='lib'):
+    if not USE_COLOR:
+        return name
+    if kind == 'lib':
+        return colored(name, "yellow")
+    elif kind == 'exe':
+        return colored(name, "blue")
+    elif kind == 'tst':
+        return colored(name, "grey")
+    return name
+
+
+cloc_memo = {} # Memoized
+def count_lines_of_code(path):
+    if path in cloc_memo:
+        return cloc_memo[path]
+
+    code_lines = 0
+    comment_lines = 0
+
+    for root, _, files in os.walk(path):
+        for file in files:
+            # Process only .c and .h files, skip temporary or preprocessed ones
+            if file.endswith(('.c', '.h')) and '#' not in file and '~' not in file:
+                file_path = os.path.join(root, file)
+                in_block_comment = False
+
+                with open(file_path, 'r', errors='ignore') as f:
+                    for line in f:
+                        stripped = line.strip()
+
+                        # Skip empty/blank lines
+                        if not stripped:
+                            continue
+
+                        # Handle multi-line (/* ... */) block comments
+                        if in_block_comment:
+                            comment_lines += 1
+                            if '*/' in stripped:
+                                in_block_comment = False
+                            continue
+
+                        # Check if a new block comment starts
+                        if stripped.startswith('/*'):
+                            comment_lines += 1
+                            if '*/' not in stripped:
+                                in_block_comment = True
+                            continue
+
+                        # Single-line comment
+                        if stripped.startswith('//'):
+                            comment_lines += 1
+                            continue
+
+                        # Inline comment (code + comment on same line)
+                        if '//' in stripped or '/*' in stripped:
+                            code_part = re.split(r'//|/\*', stripped, 1)[0].strip()
+                            if code_part:
+                                code_lines += 1
+                            comment_lines += 1
+                            continue
+
+                        # Otherwise, count as code
+                        code_lines += 1
+
+    loc = (code_lines, comment_lines)
+    cloc_memo[path] = loc
+    return loc
+
+
+def parse_cmakelists(file_path):
+    with open(file_path, 'r') as f:
+        content = f.read()
+
+    libs = FIND_PACKAGE_RE.findall(content)
+    libraries = ADD_LIBRARY_RE.findall(content)
+    executables = ADD_EXECUTABLE_RE.findall(content)
+
+    dependencies = defaultdict(list)
+    for match in TARGET_LINK_LIBRARIES_RE.finditer(content):
+        target = match.group(1)
+        deps_raw = match.group(2).split()
+        # Filter out CMake visibility keywords
+        deps = [friendly_lib_name(d)
+                for d in deps_raw
+                if d.upper() not in ('PRIVATE', 'PUBLIC', 'INTERFACE')]
+        dependencies[target].extend(deps)
+
+    return libs, libraries, executables, dependencies
+
+
+class CMakeModule:
+    """
+    Store information related to an individual CMake module (aka target)
+    such as kind (executable / library) and the path in which it's defined
+    so that individual metrics like LoC can be calculated per module.
+    """
+    def __init__(self, name, kind, path):
+        self.name = name
+        self.kind = kind
+        self.path = path
+
+
+class CMakeProject:
+    """
+    Group modules, libraries (external deps) and inter-dependencies
+    into a reprentation of a CMake project.
+
+    Modules are actually targets, i.e: anything defined as an
+    'add_executable' or 'add_library'
+
+    Libs are external dependencies imported using find_package
+    or find_library, etc...
+
+    Dependencies are linked to a module using 'target_link_libraries',
+    therefore, dependencies can either be modules or external libs.
+    """
+    def __init__(self, root_dir, modules, libs, dependencies):
+        self.root_dir = root_dir
+        self.modules = modules
+        self.libs = libs
+        self.dependencies = dependencies
+        # Store longest dep name for table alignment.
+        self.max_mod_len = max((len(mod.name) for mod in modules), default=0)
+
+    @classmethod
+    def from_directory(cls, root_dir):
+        all_libs = set()
+        all_modules = set()  # (name, kind) tuples: kind = 'lib' or 'exe'
+        all_dependencies = defaultdict(list)
+
+        for path in Path(root_dir).rglob("CMakeLists.txt"):
+            if EXCLUDE in str(path):
+                continue
+            libs, libraries, executables, dependencies = parse_cmakelists(path)
+            all_libs.update(libs)
+            for lib in libraries:
+                if 'test' in lib or 'test' in str(path):
+                    if INCLUDE_TESTS:
+                        all_modules.add(CMakeModule(lib, 'lib', dirname(path)))
+                else:
+                    all_modules.add(CMakeModule(lib, 'lib', dirname(path)))
+            for exe in executables:
+                # Special cases for 'tests' naming convention.
+                if 'test' in exe or 'test' in str(path):
+                    if INCLUDE_TESTS:
+                        all_modules.add(CMakeModule(exe, 'tst', dirname(path)))
+                else:
+                    all_modules.add(CMakeModule(exe, 'exe', dirname(path)))
+            for k, v in dependencies.items():
+                all_dependencies[k].extend(v)
+
+        return cls(root_dir, all_modules, all_libs, dict(all_dependencies))
+
+    def print_dependency_matrix(self):
+        mod_types = {m.name: m.kind for m in self.modules}
+        module_names = set(mod_types.keys())
+
+        # Collect all unique dependencies
+        all_deps_set = {
+            dep for deps in self.dependencies.values()
+            for dep in deps
+        }
+
+        # Sort by kind: libs (0), exes (1), external (2)
+        def dep_sort_key(dep):
+            if dep in mod_types:
+                return (0 if mod_types[dep] == 'lib' else 1, dep)
+            return (2, dep)
+
+        all_deps = sorted(all_deps_set, key=dep_sort_key)
+
+
+        table_ljust = self.max_mod_len + 2
+        # Generate vertical headers, bottom-justified and colorized
+        max_dep_len = max((len(dep) for dep in all_deps), default=0)
+        vertical_header_rows = []
+        for i in range(max_dep_len):
+            row = " " * table_ljust  # space for module names
+            for dep in all_deps:
+                offset = max_dep_len - len(dep)
+                if i >= offset:
+                    char = dep[i - offset]
+                    if dep in module_names:
+                        kind = mod_types[dep]
+                        row += ' ' + color_module(char, kind) + ' '
+                    else:
+                        row += f" {char} "
+                else:
+                    row += "   "
+            vertical_header_rows.append(row)
+
+        # Print vertical header block:
+        for row in vertical_header_rows:
+            print(row)
+        print(" " * table_ljust + "---" * len(all_deps))
+
+        # Print sorted matrix rows:
+        def mod_sort_key(item):
+            return (0 if item.kind == 'lib' else 1, item.name)
+
+        for module in sorted(self.modules, key=mod_sort_key):
+            raw_mod = module.name.ljust(table_ljust)
+            colored_mod = color_module(module.name, module.kind)
+            padded_mod = colored_mod + ' ' * (len(raw_mod) - len(strip_ansi(colored_mod)))
+            row = padded_mod
+            mod_deps = set(self.dependencies.get(module.name, []))
+            for dep in all_deps:
+                row += " X " if dep in mod_deps else " . "
+            print(row)
+
+    def print_module_info(self):
+        table_ljust = self.max_mod_len + 2
+        def mod_sort_key(item):
+            return (0 if item.kind == 'lib' else 1, item.path)
+        print(f"{'Module'.ljust(table_ljust)} Kind  {'loc'.rjust(7)} {'cloc'.rjust(7)} Path")
+        print('-' * 65)
+        for module in sorted(self.modules, key=mod_sort_key):
+            raw_mod = module.name.ljust(table_ljust)
+            colored_mod = color_module(module.name, module.kind)
+            padded_mod = colored_mod + ' ' * (len(raw_mod) - len(strip_ansi(colored_mod)))
+            mod_loc,mod_comm = count_lines_of_code(module.path)
+            print(f"{padded_mod} ({module.kind}) {str(mod_loc).rjust(7)} {str(mod_comm).rjust(7)} {module.path}")
+
+        locs,comm = count_lines_of_code(self.root_dir)
+        print(f"\nTotal lines of C code (.c/.h): ({locs}, {comm})")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='coral', description='Coral: Lightweight CMake structure inspector')
+    parser.add_argument('command', choices=['libs', 'info', 'deps'], help='Command to run')
+    parser.add_argument('--path', default='.', help='Root path of the CMake project (default: current directory)')
+    parser.add_argument('--no-color', action='store_true', help='Disable colored output')
+    parser.add_argument('--tests', action='store_true', help='Include Test Modules')
+    parser.add_argument('--exclude', default='', help='exclude filter')
+    args = parser.parse_args()
+
+    if args.no_color:
+        global USE_COLOR
+        USE_COLOR = False
+
+    if args.tests:
+        global INCLUDE_TESTS
+        INCLUDE_TESTS = True
+
+    if args.exclude:
+        global EXCLUDE
+        EXCLUDE = args.exclude
+
+    cmake_project = CMakeProject.from_directory(args.path)
+
+    if args.command == 'libs':
+        print("External Libraries (from find_package):")
+        for lib in sorted(cmake_project.libs):
+            print(f"  - {lib}")
+
+    elif args.command == 'info':
+        print("Project Targets (add_library / add_executable):")
+        cmake_project.print_module_info()
+
+    elif args.command == 'deps':
+        print("Target Dependencies (from target_link_libraries):")
+        cmake_project.print_dependency_matrix()
+
+
+if __name__ == "__main__":
+    main()
